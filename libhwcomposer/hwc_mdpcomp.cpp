@@ -289,24 +289,17 @@ int MDPComp::prepare(hwc_context_t *ctx, hwc_layer_1_t *layer,
                     ovutils::OV_MDP_BLEND_FG_PREMULT);
         }
 
-        if (sPreRotation) {
-            if(layer->transform & HAL_TRANSFORM_FLIP_H) {
-                ovutils::setMdpFlags(mdpFlags,
-                        ovutils::OV_MDP_FLIP_H);
-            }
-
-            if(layer->transform & HAL_TRANSFORM_FLIP_V) {
-                ovutils::setMdpFlags(mdpFlags,
-                        ovutils::OV_MDP_FLIP_V);
-            }
-
-            ov.setTransform(0, dest);
-        } else {
-            ovutils::eTransform orient =
-                static_cast<ovutils::eTransform>(layer->transform);
-
-            ov.setTransform(orient, dest);
+        if(layer->transform & HAL_TRANSFORM_FLIP_H) {
+            ovutils::setMdpFlags(mdpFlags,
+                    ovutils::OV_MDP_FLIP_H);
         }
+
+        if(layer->transform & HAL_TRANSFORM_FLIP_V) {
+            ovutils::setMdpFlags(mdpFlags,
+                    ovutils::OV_MDP_FLIP_V);
+        }
+
+        ov.setTransform(0, dest);
 
         ovutils::PipeArgs parg(mdpFlags,
                                info,
@@ -379,9 +372,7 @@ bool MDPComp::is_doable(hwc_context_t *ctx, hwc_display_contents_1_t* list) {
     for(int i = 0; i < numAppLayers; ++i) {
         // As MDP h/w supports flip operation, use MDP comp only for
         // 180 transforms. Fail for any transform involving 90 (90, 270).
-        if(sPreRotation ? 
-           (list->hwLayers[i].transform & HWC_TRANSFORM_ROT_90) :
-           (list->hwLayers[i].transform) ) {
+        if(list->hwLayers[i].transform & HWC_TRANSFORM_ROT_90) {
                 ALOGD_IF(isDebug(), "%s: orientation involved",__FUNCTION__);
                 return false;
         }
@@ -733,7 +724,7 @@ int MDPComp::draw(hwc_context_t *ctx, hwc_display_contents_1_t* list) {
             dest = ovutils::OV_PIPE0;
         } else if (index == 1) {
             dest = ovutils::OV_PIPE1;
-        } else if (index == 2) {
+        } else {
             dest = ovutils::OV_PIPE2;
         }
 
