@@ -49,8 +49,6 @@ namespace qhwc {
 #define SYSFS_EDID_MODES        DEVICE_ROOT "/" DEVICE_NODE "/edid_modes"
 #define SYSFS_HPD               DEVICE_ROOT "/" DEVICE_NODE "/hpd"
 
-#define MSMFB_OVERLAY_COMMIT  _IOW(MSMFB_IOCTL_MAGIC, 163, unsigned int)
-
 
 ExternalDisplay::ExternalDisplay(hwc_context_t* ctx):mFd(-1),
     mCurrentMode(-1), mExternalDisplay(0), mModeCount(0), mHwcContext(ctx)
