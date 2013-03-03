@@ -43,7 +43,6 @@
 #include <sys/types.h>
 #include <utils/Log.h>
 #include "gralloc_priv.h" //for interlace
-
 /*
 *
 * Collection of utilities functions/structs/enums etc...
@@ -123,6 +122,9 @@ public:
 
     /* Gets height of primary framebuffer */
     int getHeight() const;
+
+    /* Indicates whether true mirroring is supported */
+    bool supportTrueMirroring() const;
 
 private:
     int mFBWidth;
@@ -264,8 +266,16 @@ enum { MAX_PATH_LEN = 256 };
  * Rotator flags: not to be confused with orientation flags.
  * Ususally, you want to open the rotator to make sure it is
  * ready for business.
- * ROT_FLAG_DISABLED: Rotator not used unless required.
- * ROT_FLAG_ENABLED: Rotator used even if not required.
+ * ROT_FLAG_DISABLED: Rotator would not kick in. (ioctl will emit errors).
+ * ROT_FLAG_ENABLED: and when rotation is needed.
+ *                   (prim video playback)
+ *                   (UI mirroring on HDMI w/ 0 degree rotator. - just memcpy)
+ * In HDMI UI mirroring, rotator is always used.
+ * Even when w/o orienation change on primary,
+ * we do 0 rotation on HDMI and using rotator buffers.
+ * That is because we might see tearing otherwise. so
+ * we use another buffer (rotator).
+ * When a simple video playback on HDMI, no rotator is being used.(null r).
  * */
 enum eRotFlags {
     ROT_FLAG_DISABLED = 0,
@@ -303,32 +313,26 @@ enum eZorder {
     ZORDER_0,
     ZORDER_1,
     ZORDER_2,
-    ZORDER_3,
     Z_SYSTEM_ALLOC = 0xFFFF
 };
 
 enum eMdpPipeType {
     OV_MDP_PIPE_RGB,
-    OV_MDP_PIPE_VG,
-    OV_MDP_PIPE_ANY, //Any
+    OV_MDP_PIPE_VG
 };
 
-/* Used to identify destination pipes
- */
+// Max pipes via overlay (VG0, VG1, RGB1)
+enum { MAX_PIPES = 3 };
+
+/* Used to identify destination channels and
+ * also 3D channels e.g. when in 3D mode with 2
+ * pipes opened and it is used in get crop/pos 3D
+ * */
 enum eDest {
-    OV_VG0 = 0,
-    OV_RGB0,
-    OV_VG1,
-    OV_RGB1,
-    OV_VG2,
-    OV_RGB2,
-    OV_INVALID,
-};
-
-/* Used when a buffer is split over 2 pipes and sent to display */
-enum {
-    OV_LEFT_SPLIT = 0,
-    OV_RIGHT_SPLIT,
+    OV_PIPE0 = 1 << 0,
+    OV_PIPE1 = 1 << 1,
+    OV_PIPE2 = 1 << 2,
+    OV_PIPE_ALL  = (OV_PIPE0 | OV_PIPE1 | OV_PIPE2)
 };
 
 /* values for copybit_set_parameter(OVERLAY_TRANSFORM) */
@@ -381,6 +385,38 @@ struct PipeArgs {
     eRotFlags rotFlags;
 };
 
+enum eOverlayState{
+    /* No pipes from overlay open */
+    OV_CLOSED = 0,
+
+    /* 2D Video */
+    OV_2D_VIDEO_ON_PANEL,
+    OV_2D_VIDEO_ON_PANEL_TV,
+    OV_2D_VIDEO_ON_TV,
+
+    /* 3D Video on one display (panel or TV) */
+    OV_3D_VIDEO_ON_2D_PANEL,
+    OV_3D_VIDEO_ON_3D_PANEL,
+    OV_3D_VIDEO_ON_3D_TV,
+
+    /* 3D Video on two displays (panel and TV) */
+    OV_3D_VIDEO_ON_2D_PANEL_2D_TV,
+
+    /* UI Mirroring */
+    OV_UI_MIRROR,
+    OV_2D_TRUE_UI_MIRROR,
+    /* Dual display with video */
+    OV_UI_VIDEO_TV,
+
+    /* Composition Bypass */
+    OV_BYPASS_1_LAYER,
+    OV_BYPASS_2_LAYER,
+    OV_BYPASS_3_LAYER,
+
+    /* External only for dual-disp */
+    OV_DUAL_DISP,
+};
+
 inline void setMdpFlags(eMdpFlags& f, eMdpFlags v) {
     f = static_cast<eMdpFlags>(setBit(f, v));
 }
@@ -394,6 +430,44 @@ enum { FB0, FB1, FB2 };
 
 //Panels could be categorized as primary and external
 enum { PRIMARY, EXTERNAL };
+
+//External Panels could use HDMI or WFD
+enum {
+    HDMI = 1,
+    WFD = 2
+};
+
+//TODO Make this a part of some appropriate class
+static int sExtType = HDMI; //HDMI or WFD
+//Set by client as HDMI/WFD
+void setExtType(const int& type);
+//Return External panel type set by client.
+int getExtType();
+
+
+//Gets the FB number for the external type.
+//As of now, HDMI always has fb1, WFD could use fb1 or fb2
+//Assumes Ext type set by setExtType() from client.
+static int getFBForPanel(int panel) { // PRIMARY OR EXTERNAL
+    switch(panel) {
+        case PRIMARY: return FB0;
+            break;
+        case EXTERNAL:
+            switch(getExtType()) {
+                case HDMI: return FB1;
+                    break;
+                case WFD: return FB2;//Hardcoding fb2 for wfd. Will change.
+                    break;
+            }
+            break;
+        default:
+            ALOGE("%s: Unrecognized PANEL category %d", __func__, panel);
+            break;
+    }
+    return -1;
+}
+
+// number of rgb pipes bufs (max)
 
 // 2 for rgb0/1 double bufs
 enum { RGB_PIPE_NUM_BUFS = 2 };
@@ -417,6 +491,7 @@ int getRotOutFmt(uint32_t format);
  * It returns MDP related enum/define that match rot+flip*/
 int getMdpOrient(eTransform rotation);
 const char* getFormatString(int format);
+const char* getStateString(eOverlayState state);
 
 // Cannot use HW_OVERLAY_MAGNIFICATION_LIMIT, since at the time
 // of integration, HW_OVERLAY_MAGNIFICATION_LIMIT was a define
@@ -507,6 +582,16 @@ inline bool isRgb(uint32_t format) {
     return false;
 }
 
+inline bool isValidDest(eDest dest)
+{
+    if ((OV_PIPE0 & dest) ||
+            (OV_PIPE1 & dest) ||
+            (OV_PIPE2 & dest)) {
+        return true;
+    }
+    return false;
+}
+
 inline const char* getFormatString(int format){
     static const char* const formats[] = {
         "MDP_RGB_565",
@@ -544,6 +629,44 @@ inline const char* getFormatString(int format){
         return "Unsupported format";
     }
     return formats[format];
+}
+
+inline const char* getStateString(eOverlayState state){
+    switch (state) {
+        case OV_CLOSED:
+            return "OV_CLOSED";
+        case OV_2D_VIDEO_ON_PANEL:
+            return "OV_2D_VIDEO_ON_PANEL";
+        case OV_2D_VIDEO_ON_PANEL_TV:
+            return "OV_2D_VIDEO_ON_PANEL_TV";
+        case OV_2D_VIDEO_ON_TV:
+            return "OV_2D_VIDEO_ON_TV";
+        case OV_3D_VIDEO_ON_2D_PANEL:
+            return "OV_3D_VIDEO_ON_2D_PANEL";
+        case OV_3D_VIDEO_ON_3D_PANEL:
+            return "OV_3D_VIDEO_ON_3D_PANEL";
+        case OV_3D_VIDEO_ON_3D_TV:
+            return "OV_3D_VIDEO_ON_3D_TV";
+        case OV_3D_VIDEO_ON_2D_PANEL_2D_TV:
+            return "OV_3D_VIDEO_ON_2D_PANEL_2D_TV";
+        case OV_UI_MIRROR:
+            return "OV_UI_MIRROR";
+        case OV_2D_TRUE_UI_MIRROR:
+            return "OV_2D_TRUE_UI_MIRROR";
+        case OV_UI_VIDEO_TV:
+            return "OV_UI_VIDEO_TV";
+        case OV_BYPASS_1_LAYER:
+            return "OV_BYPASS_1_LAYER";
+        case OV_BYPASS_2_LAYER:
+            return "OV_BYPASS_2_LAYER";
+        case OV_BYPASS_3_LAYER:
+            return "OV_BYPASS_3_LAYER";
+        case OV_DUAL_DISP:
+            return "OV_DUAL_DISP";
+        default:
+            return "UNKNOWN_STATE";
+    }
+    return "BAD_STATE";
 }
 
 inline void Whf::dump() const {
@@ -628,7 +751,7 @@ inline Dim getPositionS3DImpl(const Whf& whf)
 }
 
 template <>
-inline Dim getPositionS3DImpl<utils::OV_RIGHT_SPLIT>(const Whf& whf)
+inline Dim getPositionS3DImpl<utils::OV_PIPE1>(const Whf& whf)
 {
     switch (whf.format & OUTPUT_3D_MASK)
     {
@@ -676,7 +799,7 @@ inline Dim getCropS3DImpl(const Dim& in, uint32_t fmt) {
 }
 
 template <>
-inline Dim getCropS3DImpl<utils::OV_RIGHT_SPLIT>(const Dim& in, uint32_t fmt) {
+inline Dim getCropS3DImpl<utils::OV_PIPE1>(const Dim& in, uint32_t fmt) {
     switch (fmt & INPUT_3D_MASK)
     {
         case HAL_3D_IN_SIDE_BY_SIDE_L_R:
@@ -730,35 +853,6 @@ template <class T>
 inline void even_floor(T& value) {
     if(value & 1)
         value--;
-}
-
-inline const char* getDestStr(eDest dest) {
-    switch(dest) {
-        case OV_VG0: return "VG0";
-        case OV_RGB0: return "RGB0";
-        case OV_VG1: return "VG1";
-        case OV_RGB1: return "RGB1";
-        case OV_VG2: return "VG2";
-        case OV_RGB2: return "RGB2";
-        default: return "Invalid";
-    }
-    return "Invalid";
-}
-
-inline eMdpPipeType getPipeType(eDest dest) {
-    switch(dest) {
-        case OV_VG0:
-        case OV_VG1:
-        case OV_VG2:
-            return OV_MDP_PIPE_VG;
-        case OV_RGB0:
-        case OV_RGB1:
-        case OV_RGB2:
-            return OV_MDP_PIPE_RGB;
-        default:
-            return OV_MDP_PIPE_ANY;
-    }
-    return OV_MDP_PIPE_ANY;
 }
 
 } // namespace utils ends

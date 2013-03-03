@@ -18,58 +18,58 @@
  * limitations under the License.
  */
 
-#define HWC_FB_UPDATE 0
+#define HWC_UI_MIRROR 0
 #include <gralloc_priv.h>
 #include <fb_priv.h>
-#include "hwc_fbupdate.h"
+#include "hwc_uimirror.h"
 #include "external.h"
 
 namespace qhwc {
 
-namespace ovutils = overlay::utils;
-
 //Static Members
-bool FBUpdate::sModeOn[] = {false};
-ovutils::eDest FBUpdate::sDest[] = {ovutils::OV_INVALID};
+ovutils::eOverlayState UIMirrorOverlay::sState = ovutils::OV_CLOSED;
+bool UIMirrorOverlay::sIsUiMirroringOn = false;
 
-void FBUpdate::reset() {
-    sModeOn[HWC_DISPLAY_PRIMARY] = false;
-    sModeOn[HWC_DISPLAY_EXTERNAL] = false;
-    sDest[HWC_DISPLAY_PRIMARY] = ovutils::OV_INVALID;
-    sDest[HWC_DISPLAY_EXTERNAL] = ovutils::OV_INVALID;
+void UIMirrorOverlay::reset() {
+    sIsUiMirroringOn = false;
+    sState = ovutils::OV_CLOSED;
 }
 
-bool FBUpdate::prepare(hwc_context_t *ctx, hwc_layer_1_t *fblayer, int dpy) {
+//Prepare the overlay for the UI mirroring
+bool UIMirrorOverlay::prepare(hwc_context_t *ctx, hwc_layer_1_t *fblayer) {
+    reset();
+
     if(!ctx->mMDP.hasOverlay) {
-        ALOGD_IF(HWC_FB_UPDATE, "%s, this hw doesnt support mirroring",
+        ALOGD_IF(HWC_UI_MIRROR, "%s, this hw doesnt support mirroring",
                 __FUNCTION__);
        return false;
     }
 
-    return (sModeOn[dpy] = configure(ctx, fblayer, dpy));
+    sState = ovutils::OV_UI_MIRROR;
+    ovutils::eOverlayState newState = ctx->mOverlay[HWC_DISPLAY_EXTERNAL]->getState();
+    if(newState == ovutils::OV_UI_VIDEO_TV) {
+        sState = newState;
+    }
 
+    configure(ctx, fblayer);
+    return sIsUiMirroringOn;
 }
 
 // Configure
-bool FBUpdate::configure(hwc_context_t *ctx, hwc_layer_1_t *layer, int dpy)
+bool UIMirrorOverlay::configure(hwc_context_t *ctx, hwc_layer_1_t *layer)
 {
-    bool ret = false;
-    if (LIKELY(ctx->mOverlay)) {
-        overlay::Overlay& ov = *(ctx->mOverlay);
+    if (LIKELY(ctx->mOverlay[HWC_DISPLAY_EXTERNAL])) {
+        overlay::Overlay& ov = *(ctx->mOverlay[HWC_DISPLAY_EXTERNAL]);
+        // Set overlay state
+        ov.setState(sState);
         private_handle_t *hnd = (private_handle_t *)layer->handle;
         if (!hnd) {
             ALOGE("%s:NULL private handle for layer!", __FUNCTION__);
             return false;
         }
         ovutils::Whf info(hnd->width, hnd->height, hnd->format, hnd->size);
-
-        //Request an RGB pipe
-        ovutils::eDest dest = ov.nextPipe(ovutils::OV_MDP_PIPE_RGB, dpy);
-        if(dest == ovutils::OV_INVALID) { //None available
-            return false;
-        }
-
-        sDest[dpy] = dest;
+        // Determine the RGB pipe for UI depending on the state
+        ovutils::eDest dest = ovutils::OV_PIPE0;
 
         ovutils::eMdpFlags mdpFlags = ovutils::OV_MDP_FLAGS_NONE;
         if(ctx->mSecureMode) {
@@ -80,9 +80,10 @@ bool FBUpdate::configure(hwc_context_t *ctx, hwc_layer_1_t *layer, int dpy)
         ovutils::PipeArgs parg(mdpFlags,
                 info,
                 ovutils::ZORDER_0,
-                ovutils::IS_FG_SET,
+                ovutils::IS_FG_OFF,
                 ovutils::ROT_FLAG_DISABLED);
-        ov.setSource(parg, dest);
+        ovutils::PipeArgs pargs[ovutils::MAX_PIPES] = { parg, parg, parg };
+        ov.setSource(pargs, dest);
 
         hwc_rect_t sourceCrop = layer->sourceCrop;
         // x,y,w,h
@@ -103,27 +104,36 @@ bool FBUpdate::configure(hwc_context_t *ctx, hwc_layer_1_t *layer, int dpy)
                 displayFrame.bottom - displayFrame.top);
         ov.setPosition(dpos, dest);
 
-        ret = true;
         if (!ov.commit(dest)) {
             ALOGE("%s: commit fails", __FUNCTION__);
-            ret = false;
+            sIsUiMirroringOn = false;
+            return false;
         }
+        sIsUiMirroringOn = true;
     }
-    return ret;
+    return sIsUiMirroringOn;
 }
 
-bool FBUpdate::draw(hwc_context_t *ctx, hwc_layer_1_t *layer, int dpy)
+bool UIMirrorOverlay::draw(hwc_context_t *ctx, hwc_layer_1_t *layer)
 {
-    if(!sModeOn[dpy]) {
+    if(!sIsUiMirroringOn) {
         return true;
     }
     bool ret = true;
-    overlay::Overlay& ov = *(ctx->mOverlay);
-    ovutils::eDest dest = sDest[dpy];
+    overlay::Overlay& ov = *(ctx->mOverlay[HWC_DISPLAY_EXTERNAL]);
+    ovutils::eOverlayState state = ov.getState();
+    ovutils::eDest dest = ovutils::OV_PIPE0;
     private_handle_t *hnd = (private_handle_t *)layer->handle;
-    if (!ov.queueBuffer(hnd->fd, hnd->offset, dest)) {
-        ALOGE("%s: queueBuffer failed for external", __FUNCTION__);
-        ret = false;
+    switch (state) {
+        case ovutils::OV_UI_MIRROR:
+        case ovutils::OV_UI_VIDEO_TV:
+            if (!ov.queueBuffer(hnd->fd, hnd->offset, dest)) {
+                ALOGE("%s: queueBuffer failed for external", __FUNCTION__);
+                ret = false;
+            }
+            break;
+        default:
+            break;
     }
     return ret;
 }
